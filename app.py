@@ -2,6 +2,11 @@ import os, re, json, hashlib
 from pathlib import Path
 from datetime import datetime
 import streamlit as st
+from services.document_reader import extract_document, validate_document
+from services.visual_checker import compare_logo
+from database.audit_store import initialize_database, log_event, get_audit_logs
+
+initialize_database()
 
 st.set_page_config(page_title='BrandPilot', page_icon='🛡️', layout='wide')
 DATA=Path(os.getenv('BRANDPILOT_DATA_DIR','.brandpilot_data')); DATA.mkdir(exist_ok=True)
@@ -67,22 +72,74 @@ def review(draft,guides,terms,facts):
 with st.sidebar:
     st.header('Brand workspace')
     brand=st.text_input('Brand name','BrandPilot')
+
+    st.subheader('Reviewer identity')
+    reviewer_name = st.text_input(
+        'Reviewer name',
+        value='Demo Reviewer'
+    )
+    reviewer_role = st.selectbox(
+        'Reviewer role',
+        ['Creator', 'Reviewer', 'Admin']
+    )
+
     guides=st.text_area('Brand guidelines',GUIDE,height=180)
     terms=st.text_area('Approved terminology (preferred | avoid)',TERMS,height=120)
     facts=st.text_area('Approved facts (one per line)',FACTS,height=140)
     st.caption('AI is optional. Set GEMINI_API_KEY to enable Gemini analysis. Avoid confidential demo data.')
-review_tab,history_tab,about_tab=st.tabs(['🔎 Review content','🗂️ Review history','ℹ️ About & limitations'])
+review_tab, visual_tab, history_tab, about_tab = st.tabs([
+    '🔎 Review content',
+    '🎨 Visual brand check',
+    '🗂️ Review history',
+    'ℹ️ About & limitations'
+])
 with review_tab:
     a,b=st.columns([1,1],gap='large')
     with a:
         st.subheader('1. Submit content')
-        typ=st.selectbox('Content type',['Social post','Marketing copy','Email','Landing page','Press release','Other'])
-        draft=st.text_area('Draft content',SAMPLE,height=250)
-        up=st.file_uploader('Or upload a .txt / .md file',type=['txt','md'])
+        typ = st.selectbox(
+            'Content type',
+            ['Social post', 'Marketing copy', 'Email', 'Landing page', 'Press release', 'Other']
+        )
+
+        if 'draft_input' not in st.session_state:
+            st.session_state['draft_input'] = SAMPLE
+
+        up = st.file_uploader(
+            'Or upload a document',
+            type=['pdf', 'docx', 'txt', 'md']
+        )
+
         if up:
-            try:draft=up.getvalue().decode('utf-8');st.info('Draft loaded from uploaded file.')
-            except:st.error('Could not decode file; paste the text instead.')
-        go=st.button('Run brand review',type='primary',use_container_width=True)
+            try:
+                upload_signature = f'{up.name}_{up.size}'
+
+                if st.session_state.get('loaded_upload') != upload_signature:
+                    extracted_text = extract_document(up.name, up.getvalue())
+                    extracted_text, was_truncated = validate_document(extracted_text)
+
+                    st.session_state['draft_input'] = extracted_text
+                    st.session_state['loaded_upload'] = upload_signature
+
+                    st.success(f'Document loaded: {up.name}')
+
+                    if was_truncated:
+                        st.warning('Document limited to the first 50,000 characters.')
+
+            except Exception as e:
+                st.error(f'Could not read document: {e}')
+
+        draft = st.text_area(
+            'Draft content',
+            height=250,
+            key='draft_input'
+        )
+
+        go = st.button(
+            'Run brand review',
+            type='primary',
+            use_container_width=True
+        )
     with b:
         st.subheader('2. Explained findings')
         if go:
@@ -106,7 +163,19 @@ with review_tab:
                 r['status']=status;r['reviewer_comment']=comment;r['decision_at']=datetime.now().strftime('%Y-%m-%d %H:%M');h=history_load()
                 for i in range(len(h)-1,-1,-1):
                     if h[i].get('id')==r['id']:h[i]=r;break
-                history_save(h);st.session_state['result']=r;st.success('Human decision saved.')
+                history_save(h)
+
+                log_event(
+                    review_id=r['id'],
+                    reviewer=reviewer_name,
+                    role=reviewer_role,
+                    action='Review decision saved',
+                    decision=status,
+                    comment=comment
+                )
+
+                st.session_state['result'] = r
+                st.success('Human decision and audit record saved.')
             st.markdown('### Editable revision')
             revised=draft
             for p,a0 in pairs(terms):revised=re.sub(r'\b'+re.escape(a0)+r'\b',p,revised,flags=re.I)
@@ -115,8 +184,101 @@ with review_tab:
                 if edit.strip():
                     fs2,ai2=review(edit,guides,terms,facts);nr={'id':hashlib.sha1((edit+datetime.now().isoformat()).encode()).hexdigest()[:10],'created_at':datetime.now().strftime('%Y-%m-%d %H:%M'),'brand':brand,'content_type':typ,'draft':edit,'findings':fs2,'ai':ai2,'status':'Needs review','guidelines':guides,'terms':terms,'facts':facts,'parent_review_id':r['id']};h=history_load();h.append(nr);history_save(h);st.session_state['result']=nr;st.rerun()
         else:st.info('Run a review to see findings. The sample draft contains intentional issues.')
+with visual_tab:
+    st.subheader('Visual Brand & Asset Verification')
+
+    st.write(
+        'Compare an approved brand logo against a marketing creative '
+        'to identify potential visual matches.'
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        reference_logo = st.file_uploader(
+            'Upload approved reference logo',
+            type=['png', 'jpg', 'jpeg'],
+            key='reference_logo'
+        )
+
+    with col2:
+        creative = st.file_uploader(
+            'Upload marketing creative',
+            type=['png', 'jpg', 'jpeg'],
+            key='marketing_creative'
+        )
+
+    if reference_logo and creative:
+        st.markdown('### Uploaded assets')
+
+        p1, p2 = st.columns(2)
+
+        with p1:
+            st.image(reference_logo, caption='Approved reference logo')
+
+        with p2:
+            st.image(creative, caption='Marketing creative')
+
+        if st.button('Compare visual assets', type='primary'):
+            try:
+                result = compare_logo(
+                    reference_logo.getvalue(),
+                    creative.getvalue()
+                )
+
+                st.markdown('### Comparison results')
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric('Feature match score', f"{result['score']}%")
+                m2.metric('Good matches', result['matches'])
+                m3.metric('Reference features', result['reference_features'])
+
+                st.info(result['status'])
+
+                st.caption(
+                    f"Creative features detected: {result['creative_features']}"
+                )
+
+                st.warning(
+                    'Automated visual screening only. A low score does not '
+                    'prove that a logo is missing or incorrect. A high score '
+                    'does not certify brand compliance. Human verification '
+                    'is required.'
+                )
+
+            except Exception as e:
+                st.error(f'Visual comparison failed: {e}')
+
+    else:
+        st.info('Upload both images to begin visual verification.')
 with history_tab:
     st.subheader('Saved review history');h=history_load()
+    st.divider()
+    st.subheader('Database-backed audit trail')
+
+    audit_logs = get_audit_logs(limit=100)
+
+    if audit_logs:
+        st.caption('Latest 100 recorded review actions, stored in SQLite.')
+
+        st.dataframe(
+            [
+                {
+                    'Review ID': x['review_id'],
+                    'Reviewer': x['reviewer'],
+                    'Role': x['role'],
+                    'Action': x['action'],
+                    'Decision': x['decision'],
+                    'Comment': x['comment'],
+                    'Timestamp (UTC)': x['timestamp']
+                }
+                for x in audit_logs
+            ],
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info('No audit events recorded yet.')
     if not h:st.info('No reviews saved yet.')
     for x in reversed(h[-30:]):
         with st.expander(f"{x.get('created_at')} · {x.get('brand')} · {x.get('status')} · {len(x.get('findings',[]))} findings"):
